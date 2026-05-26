@@ -1,11 +1,15 @@
 import { Pool } from 'pg';
 import { config } from '../config';
 
+const sslConfig = config.databaseUrl.includes('sslmode=no-verify')
+  ? { rejectUnauthorized: false }
+  : config.databaseUrl.includes('sslmode=disable')
+    ? false
+    : { rejectUnauthorized: false };
+
 export const pool = new Pool({
   connectionString: config.databaseUrl,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: sslConfig,
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
