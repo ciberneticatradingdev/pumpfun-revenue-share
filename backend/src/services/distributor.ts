@@ -165,8 +165,8 @@ export async function distributeUsdc(
         paymentCount: batch.length,
       });
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      logger.error(`Batch ${batchIdx + 1} failed`, { error: errorMessage });
+      const errorMessage = err instanceof Error ? err.message : (typeof err === 'object' ? JSON.stringify(err) : String(err));
+      logger.error(`Batch ${batchIdx + 1} failed`, { error: errorMessage, stack: err instanceof Error ? err.stack : undefined });
 
       // Mark batch payments as failed
       for (const payment of batch) {
