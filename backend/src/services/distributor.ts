@@ -1,6 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
 import {
-  getAssociatedTokenAddress,
+  getAssociatedTokenAddressSync,
   createAssociatedTokenAccountIdempotentInstruction,
   createTransferInstruction,
   TOKEN_PROGRAM_ID,
@@ -105,7 +105,7 @@ export async function distributeUsdc(
   let failCount = 0;
   const batches = chunkArray(payments, config.batchSize);
 
-  const deployerUsdcAta = await getAssociatedTokenAddress(
+  const deployerUsdcAta = getAssociatedTokenAddressSync(
     config.usdcMint,
     config.walletPublicKey
   );
@@ -119,7 +119,7 @@ export async function distributeUsdc(
 
       for (const payment of batch) {
         const recipientPubkey = new PublicKey(payment.wallet);
-        const recipientAta = await getAssociatedTokenAddress(
+        const recipientAta = getAssociatedTokenAddressSync(
           config.usdcMint,
           recipientPubkey
         );

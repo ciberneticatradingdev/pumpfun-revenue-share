@@ -2,6 +2,8 @@ import {
   Connection,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
   Keypair,
   ComputeBudgetProgram,
   SendOptions,
@@ -22,13 +24,6 @@ export function getConnection(): Connection {
   return connectionInstance;
 }
 
-export function addPriorityFees(transaction: Transaction): void {
-  transaction.add(
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 })
-  );
-}
-
 export interface SendTransactionResult {
   signature: TransactionSignature;
   confirmed: boolean;
@@ -42,24 +37,31 @@ export async function sendTransactionWithRetry(
   const connection = getConnection();
   const backoffMs = [1000, 2000, 4000];
 
+  // Add priority fees
+  const allInstructions = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+    ...instructions,
+  ];
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const transaction = new Transaction();
-      addPriorityFees(transaction);
-      instructions.forEach((ix) => transaction.add(ix));
-
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = signers[0].publicKey;
-      transaction.sign(...signers);
 
-      const sendOptions: SendOptions = {
-        skipPreflight: true,
-        maxRetries: 0,
-      };
+      const messageV0 = new TransactionMessage({
+        payerKey: signers[0].publicKey,
+        recentBlockhash: blockhash,
+        instructions: allInstructions,
+      }).compileToV0Message();
+
+      const tx = new VersionedTransaction(messageV0);
+      tx.sign(signers);
 
       logger.info(`Sending transaction attempt ${attempt + 1}/${maxRetries}`);
-      const signature = await connection.sendRawTransaction(transaction.serialize(), sendOptions);
+      const signature = await connection.sendTransaction(tx, {
+        skipPreflight: true,
+        maxRetries: 0,
+      });
       logger.info('Transaction sent', { signature });
 
       const confirmation = await connection.confirmTransaction(
