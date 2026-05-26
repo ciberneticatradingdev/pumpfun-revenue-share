@@ -1,5 +1,5 @@
 import { PublicKey } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
 import { config } from '../config';
 import { pool } from '../db/pool';
 import { logger } from '../utils/logger';
@@ -29,20 +29,27 @@ export async function takeSnapshot(): Promise<SnapshotResult> {
   const connection = getConnection();
   logger.info('Taking holder snapshot...');
 
-  // Get all token accounts for this mint
-  const accounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
-    filters: [
-      { dataSize: 165 },
-      {
-        memcmp: {
-          offset: 0,
-          bytes: config.tokenMint.toBase58(),
-        },
-      },
-    ],
-  });
+  // Get all token accounts for this mint — try both Token Program and Token-2022
+  const [classicAccounts, token2022Accounts] = await Promise.all([
+    connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
+      filters: [
+        { dataSize: 165 },
+        { memcmp: { offset: 0, bytes: config.tokenMint.toBase58() } },
+      ],
+    }).catch(() => []),
+    connection.getProgramAccounts(TOKEN_2022_PROGRAM_ID, {
+      filters: [
+        { memcmp: { offset: 0, bytes: config.tokenMint.toBase58() } },
+      ],
+    }).catch(() => []),
+  ]);
 
-  logger.info(`Found ${accounts.length} token accounts`);
+  const accounts = [...classicAccounts, ...token2022Accounts];
+
+  logger.info(`Found ${accounts.length} token accounts`, {
+    classic: classicAccounts.length,
+    token2022: token2022Accounts.length,
+  });
 
   // Build exclusion set
   const exclusionSet = new Set<string>([
