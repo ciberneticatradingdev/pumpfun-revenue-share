@@ -58,6 +58,27 @@ export async function takeSnapshot(): Promise<SnapshotResult> {
     config.feeAccount.toBase58(),
   ]);
 
+  // Dynamically exclude bonding curve and associated bonding curve
+  // Fetch from pump.fun API
+  try {
+    const response = await fetch(
+      `https://frontend-api-v3.pump.fun/coins/${config.tokenMint.toBase58()}`
+    );
+    if (response.ok) {
+      const data = await response.json() as Record<string, string>;
+      if (data.bonding_curve) {
+        exclusionSet.add(data.bonding_curve);
+        logger.info('Excluding bonding curve', { address: data.bonding_curve });
+      }
+      if (data.associated_bonding_curve) {
+        exclusionSet.add(data.associated_bonding_curve);
+        logger.info('Excluding associated bonding curve', { address: data.associated_bonding_curve });
+      }
+    }
+  } catch {
+    logger.warn('Could not fetch bonding curve info from pump.fun API');
+  }
+
   // Parse accounts
   const holders: Array<{ wallet: string; rawBalance: bigint }> = [];
   let totalEligibleSupply = BigInt(0);
