@@ -1,16 +1,20 @@
 import {
   PublicKey,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+  SystemProgram,
 } from '@solana/web3.js';
 import {
-  getAssociatedTokenAddress,
+  getAssociatedTokenAddressSync,
   createAssociatedTokenAccountIdempotentInstruction,
   TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import { config } from '../config';
 import { pool } from '../db/pool';
 import { logger } from '../utils/logger';
-import { getConnection, sendTransactionWithRetry } from '../utils/solana';
+import { getConnection } from '../utils/solana';
 
 export interface ClaimResult {
   claimed: boolean;
@@ -18,6 +22,18 @@ export interface ClaimResult {
   txSignature: string;
   claimRoundId: number;
 }
+
+// Fee accumulator — collects USDC creator fees from bonding curve trades
+const FEE_ACCUMULATOR = new PublicKey('79zVwEh3BHYs5N352uNuCQZv16swdtriAP1Sgm6ksbLA');
+
+// CollectCreatorFeeV2 discriminator
+const COLLECT_CREATOR_FEE_V2_DISC = Buffer.from('cf118af204221338', 'hex');
+
+// Event authority PDA
+const [EVENT_AUTHORITY] = PublicKey.findProgramAddressSync(
+  [Buffer.from('__event_authority')],
+  config.pumpswapProgram
+);
 
 async function logEvent(type: string, message: string, data?: Record<string, unknown>): Promise<void> {
   await pool.query(
@@ -35,6 +51,28 @@ async function getTokenAccountBalance(connection: ReturnType<typeof getConnectio
   }
 }
 
+function buildCollectCreatorFeeUSDC(): TransactionInstruction {
+  const creatorUsdcAta = getAssociatedTokenAddressSync(config.usdcMint, config.walletPublicKey);
+  const feeAccumulatorUsdcAta = getAssociatedTokenAddressSync(config.usdcMint, FEE_ACCUMULATOR, true);
+
+  return new TransactionInstruction({
+    programId: config.pumpswapProgram,
+    keys: [
+      { pubkey: config.walletPublicKey, isSigner: true, isWritable: true },
+      { pubkey: creatorUsdcAta, isSigner: false, isWritable: true },
+      { pubkey: FEE_ACCUMULATOR, isSigner: false, isWritable: true },
+      { pubkey: feeAccumulatorUsdcAta, isSigner: false, isWritable: true },
+      { pubkey: config.usdcMint, isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
+      { pubkey: config.pumpswapProgram, isSigner: false, isWritable: false },
+    ],
+    data: COLLECT_CREATOR_FEE_V2_DISC,
+  });
+}
+
 export async function claimCreatorFees(): Promise<ClaimResult | null> {
   const connection = getConnection();
 
@@ -42,11 +80,7 @@ export async function claimCreatorFees(): Promise<ClaimResult | null> {
   logger.info('Starting fee claim...');
 
   try {
-    // Get deployer's USDC ATA
-    const deployerUsdcAta = await getAssociatedTokenAddress(
-      config.usdcMint,
-      config.walletPublicKey
-    );
+    const deployerUsdcAta = getAssociatedTokenAddressSync(config.usdcMint, config.walletPublicKey);
 
     // Get balance BEFORE claim
     const balanceBefore = await getTokenAccountBalance(connection, deployerUsdcAta);
@@ -60,37 +94,59 @@ export async function claimCreatorFees(): Promise<ClaimResult | null> {
       config.usdcMint
     );
 
-    // Build CollectCreatorFeeV2 instruction
-    const discriminator = Buffer.from('cf118af204221338', 'hex');
+    // Build collect instruction
+    const collectIx = buildCollectCreatorFeeUSDC();
 
-    // Derive fee vault PDA
-    // Account keys for CollectCreatorFeeV2:
-    // 0: pool (fee_account from config)
-    // 1: creator (signer) 
-    // 2: creator_token_account (deployer USDC ATA)
-    // 3: fee_vault (fee account)
-    // 4: token_program
-    // 5: system_program
-    const collectFeeIx = new TransactionInstruction({
-      programId: config.pumpswapProgram,
-      keys: [
-        { pubkey: config.feeAccount, isSigner: false, isWritable: true },
-        { pubkey: config.walletPublicKey, isSigner: true, isWritable: true },
-        { pubkey: deployerUsdcAta, isSigner: false, isWritable: true },
-        { pubkey: config.feeAccount, isSigner: false, isWritable: true },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: new PublicKey('11111111111111111111111111111111'), isSigner: false, isWritable: false },
-      ],
-      data: discriminator,
+    // Build versioned transaction
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    const messageV0 = new TransactionMessage({
+      payerKey: config.walletPublicKey,
+      recentBlockhash: blockhash,
+      instructions: [createAtaIx, collectIx],
+    }).compileToV0Message();
+
+    const tx = new VersionedTransaction(messageV0);
+    tx.sign([config.walletKeypair]);
+
+    // Simulate first to check for "No creator fee to collect"
+    const sim = await connection.simulateTransaction(tx);
+    if (sim.value.err) {
+      const logs = sim.value.logs || [];
+      const noFeeLog = logs.some((l: string) => l.includes('No creator fee to collect'));
+      if (noFeeLog) {
+        logger.info('No creator fees to collect');
+        await logEvent('claim_completed', 'No fees available to claim', { reason: 'no_fees' });
+        return null;
+      }
+      throw new Error(`Simulation failed: ${JSON.stringify(sim.value.err)}`);
+    }
+
+    // Check simulation logs for "No creator fee to collect" even without error
+    const noFee = sim.value.logs?.some((l: string) => l.includes('No creator fee to collect'));
+    if (noFee) {
+      logger.info('No creator fees to collect (from sim logs)');
+      await logEvent('claim_completed', 'No fees available to claim', { reason: 'no_fees_in_logs' });
+      return null;
+    }
+
+    // Send for real
+    const txSignature = await connection.sendTransaction(tx, {
+      skipPreflight: true,
+      maxRetries: 3,
     });
+    logger.info('Claim transaction sent', { signature: txSignature });
 
-    // Send transaction
-    const result = await sendTransactionWithRetry(
-      [createAtaIx, collectFeeIx],
-      [config.walletKeypair]
-    );
+    // Confirm
+    await connection.confirmTransaction({
+      signature: txSignature,
+      blockhash,
+      lastValidBlockHeight,
+    }, 'confirmed');
+    logger.info('Claim transaction confirmed', { signature: txSignature });
 
     // Get balance AFTER claim
+    // Small delay to ensure balance is updated
+    await new Promise(resolve => setTimeout(resolve, 2000));
     const balanceAfter = await getTokenAccountBalance(connection, deployerUsdcAta);
     logger.info('USDC balance after claim', { balance: balanceAfter.toString() });
 
@@ -99,7 +155,7 @@ export async function claimCreatorFees(): Promise<ClaimResult | null> {
     if (deltaRaw <= BigInt(0)) {
       logger.info('No fees to claim (delta = 0)');
       await logEvent('claim_completed', 'No fees available to claim', {
-        txSignature: result.signature,
+        txSignature,
         delta: '0',
       });
       return null;
@@ -107,19 +163,19 @@ export async function claimCreatorFees(): Promise<ClaimResult | null> {
 
     // Convert raw amount to human-readable (6 decimals)
     const amountUsdc = formatUsdcAmount(deltaRaw);
-    logger.info('Fees claimed successfully', { amountUsdc, txSignature: result.signature });
+    logger.info('Fees claimed successfully', { amountUsdc, txSignature });
 
     // Record in database
     const insertResult = await pool.query<{ id: number }>(
       `INSERT INTO claim_rounds (tx_signature, amount_usdc, fee_account, status)
        VALUES ($1, $2, $3, 'completed') RETURNING id`,
-      [result.signature, amountUsdc, config.feeAccount.toBase58()]
+      [txSignature, amountUsdc, FEE_ACCUMULATOR.toBase58()]
     );
 
     const claimRoundId = insertResult.rows[0].id;
 
     await logEvent('claim_completed', `Claimed ${amountUsdc} USDC`, {
-      txSignature: result.signature,
+      txSignature,
       amountUsdc,
       claimRoundId,
     });
@@ -127,7 +183,7 @@ export async function claimCreatorFees(): Promise<ClaimResult | null> {
     return {
       claimed: true,
       amountUsdc,
-      txSignature: result.signature,
+      txSignature,
       claimRoundId,
     };
   } catch (err) {
